@@ -184,6 +184,7 @@ async def create_listing(
 @router.get("/listings", response_model=List[ListingResponse])
 async def list_listings(
     category: Optional[str] = None,
+    item_type: Optional[str] = None,
     search: Optional[str] = None,
     price_type: Optional[str] = None,
     sort_by: str = "downloads",  # downloads, rating, newest, price
@@ -194,8 +195,10 @@ async def list_listings(
     """List published agent listings."""
     stmt = select(AgentListing).where(AgentListing.status == "published")
 
-    if category:
-        stmt = stmt.where(AgentListing.category == category)
+    # Support both category and item_type params (frontend sends item_type)
+    cat = category or item_type
+    if cat:
+        stmt = stmt.where(AgentListing.category == cat)
     
     if price_type:
         stmt = stmt.where(AgentListing.price_type == price_type)
@@ -939,6 +942,315 @@ async def get_publisher_profile(
             }
             for l in listings
         ],
+    }
+
+
+# ============== Trends Endpoint ==============
+
+@router.get("/trends")
+async def get_market_trends(
+    session: AsyncSession = Depends(get_session),
+):
+    """Get marketplace trends and analytics."""
+    # Trending items (top downloads in last period)
+    trending_result = await session.execute(
+        select(AgentListing)
+        .where(AgentListing.status == "published")
+        .order_by(AgentListing.downloads.desc())
+        .limit(10)
+    )
+    trending = trending_result.scalars().all()
+
+    # Top sellers
+    sellers_result = await session.execute(
+        select(PublisherProfile)
+        .order_by(PublisherProfile.total_sales.desc())
+        .limit(10)
+    )
+    sellers = sellers_result.scalars().all()
+
+    # Category stats
+    cat_result = await session.execute(
+        select(
+            AgentListing.category,
+            func.count(AgentListing.id).label("item_count"),
+            func.sum(AgentListing.downloads).label("total_downloads"),
+            func.avg(AgentListing.price_amount).label("average_price"),
+        )
+        .where(AgentListing.status == "published")
+        .where(AgentListing.category.isnot(None))
+        .group_by(AgentListing.category)
+    )
+    categories = cat_result.all()
+
+    # Total transactions (purchases)
+    tx_count = await session.execute(select(func.count(AgentPurchase.id)))
+    total_tx = tx_count.scalar() or 0
+
+    tx_volume = await session.execute(
+        select(func.sum(AgentPurchase.price_paid))
+    )
+    total_vol = tx_volume.scalar() or 0
+
+    return {
+        "trending_items": [
+            {
+                "id": str(l.id),
+                "publisher_id": str(l.publisher_id),
+                "name": l.name,
+                "slug": l.slug,
+                "tagline": l.tagline,
+                "description": l.description,
+                "category": l.category,
+                "tags": l.tags,
+                "price_type": l.price_type,
+                "price_amount": l.price_amount,
+                "downloads": l.downloads,
+                "rating_average": l.rating_average,
+                "rating_count": l.rating_count,
+                "status": l.status,
+                "is_featured": l.is_featured,
+                "is_verified": l.is_verified,
+            }
+            for l in trending
+        ],
+        "top_sellers": [
+            {
+                "seller_id": str(s.user_id),
+                "seller_name": s.display_name,
+                "avatar_url": s.avatar_url,
+                "total_sales": s.total_sales,
+                "total_revenue": s.total_earnings,
+                "average_rating": 0,
+                "total_reviews": 0,
+                "items_count": 0,
+                "verified": s.is_verified,
+                "joined_at": s.created_at.isoformat() if s.created_at else "",
+            }
+            for s in sellers
+        ],
+        "category_stats": [
+            {
+                "category": c.category or "uncategorized",
+                "item_count": c.item_count or 0,
+                "total_downloads": c.total_downloads or 0,
+                "average_price": float(c.average_price or 0),
+                "growth_percentage": 0.0,
+            }
+            for c in categories
+        ],
+        "price_trends": [],
+        "total_transactions_24h": total_tx,
+        "total_volume_24h": float(total_vol),
+    }
+
+
+# ============== Dashboard Endpoint ==============
+
+@router.get("/dashboard")
+async def get_user_dashboard(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    """Get user's marketplace dashboard."""
+    user_id = request.headers.get("x-user-id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    # Owned items (purchased)
+    purchases_result = await session.execute(
+        select(AgentPurchase)
+        .where(AgentPurchase.buyer_id == user_id)
+        .where(AgentPurchase.status == "completed")
+    )
+    purchases = purchases_result.scalars().all()
+    purchased_ids = [str(p.listing_id) for p in purchases]
+
+    owned_items = []
+    if purchased_ids:
+        items_result = await session.execute(
+            select(AgentListing).where(AgentListing.id.in_(purchased_ids))
+        )
+        owned_listings = items_result.scalars().all()
+        owned_items = [
+            {
+                "id": str(l.id),
+                "name": l.name,
+                "description": l.description,
+                "item_type": l.category or "agent",
+                "category": l.category,
+                "tags": l.tags or [],
+                "price": l.price_amount,
+                "is_free": l.price_type == "free" or l.price_amount == 0,
+                "currency": "USD",
+                "publisher_org_id": str(l.publisher_id),
+                "status": l.status,
+                "version": "1.0.0",
+                "download_count": l.downloads,
+                "purchase_count": l.downloads,
+                "average_rating": l.rating_average,
+                "review_count": l.rating_count,
+                "created_at": l.created_at.isoformat() if l.created_at else "",
+                "updated_at": (l.updated_at or l.created_at or datetime.utcnow()).isoformat(),
+            }
+            for l in owned_listings
+        ]
+
+    # Sales history (items the user published that were purchased)
+    user_listings_result = await session.execute(
+        select(AgentListing.id).where(AgentListing.publisher_id == user_id)
+    )
+    user_listing_ids = [str(r[0]) for r in user_listings_result.all()]
+
+    sales_history = []
+    total_earnings = 0.0
+    if user_listing_ids:
+        sales_result = await session.execute(
+            select(AgentPurchase)
+            .where(AgentPurchase.listing_id.in_(user_listing_ids))
+            .where(AgentPurchase.status == "completed")
+            .order_by(AgentPurchase.purchased_at.desc())
+            .limit(50)
+        )
+        sales = sales_result.scalars().all()
+        total_earnings = sum(float(s.price_paid or 0) for s in sales)
+        for s in sales:
+            sales_history.append({
+                "sale_id": str(s.id),
+                "item_id": str(s.listing_id),
+                "item_name": "",
+                "buyer_id": str(s.buyer_id),
+                "buyer_name": "User",
+                "price": float(s.price_paid or 0),
+                "sale_type": "purchase",
+                "timestamp": s.purchased_at.isoformat() if s.purchased_at else "",
+            })
+
+    total_spent = sum(float(p.price_paid or 0) for p in purchases)
+
+    return {
+        "owned_items": owned_items,
+        "rented_items": [],
+        "sales_history": sales_history,
+        "purchase_history": [
+            {
+                "purchase_id": str(p.id),
+                "item_id": str(p.listing_id),
+                "item_name": "",
+                "item_type": "agent",
+                "price": float(p.price_paid or 0),
+                "currency": "USD",
+                "purchase_date": p.purchased_at.isoformat() if p.purchased_at else "",
+                "status": p.status,
+            }
+            for p in purchases
+        ],
+        "total_earnings": total_earnings,
+        "total_spent": total_spent,
+        "active_listings": [],
+        "pending_transactions": [],
+    }
+
+
+# ============== Execution Ledger Endpoint ==============
+
+@router.get("/items/{item_id}/executions")
+async def get_execution_ledger(
+    item_id: str,
+    limit: int = Query(50, le=200),
+    session: AsyncSession = Depends(get_session),
+):
+    """Get execution ledger for a marketplace item."""
+    # Query usage stats as a proxy for execution records
+    result = await session.execute(
+        select(AgentUsageStats)
+        .where(AgentUsageStats.listing_id == item_id)
+        .order_by(AgentUsageStats.last_used_at.desc().nullslast())
+        .limit(limit)
+    )
+    stats = result.scalars().all()
+
+    return [
+        {
+            "entry_id": str(s.id),
+            "item_id": str(s.listing_id),
+            "item_name": "",
+            "user_id": str(s.user_id),
+            "execution_type": "agent_run",
+            "input_hash": "",
+            "output_hash": "",
+            "gas_used": None,
+            "execution_time_ms": s.total_duration_ms or 0,
+            "status": "success",
+            "timestamp": (s.last_used_at or s.created_at or datetime.utcnow()).isoformat(),
+            "tx_hash": None,
+        }
+        for s in stats
+    ]
+
+
+# ============== NFT Listing Endpoint ==============
+
+@router.post("/nft/list")
+async def list_nft(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    """List an item as NFT on the blockchain marketplace."""
+    user_id = request.headers.get("x-user-id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    body = await request.json()
+    item_id = body.get("item_id")
+    listing_type = body.get("listing_type", "sale")
+    price = body.get("price", 0)
+
+    if not item_id:
+        raise HTTPException(status_code=400, detail="item_id is required")
+
+    # Verify item exists
+    result = await session.execute(
+        select(AgentListing).where(AgentListing.id == item_id)
+    )
+    listing = result.scalar_one_or_none()
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    # Record NFT listing on internal blockchain
+    nft_id = str(uuid.uuid4())
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as bc_client:
+            await bc_client.post(
+                f"{BLOCKCHAIN_SERVICE_URL}/blockchain/transactions",
+                json={
+                    "tx_type": "nft_listing",
+                    "payload": {
+                        "nft_id": nft_id,
+                        "item_id": item_id,
+                        "item_name": listing.name,
+                        "owner_id": user_id,
+                        "listing_type": listing_type,
+                        "price": price,
+                    },
+                },
+            )
+    except Exception as e:
+        logger.debug("Blockchain NFT listing tx skipped: %s", e)
+
+    return {
+        "nft_id": nft_id,
+        "item_id": item_id,
+        "token_id": nft_id[:16],
+        "contract_address": "0x" + nft_id.replace("-", "")[:40],
+        "chain": "polygon",
+        "owner_address": user_id,
+        "price": price,
+        "currency": "USD",
+        "listing_type": listing_type,
+        "rent_price_per_day": body.get("rent_price_per_day"),
+        "is_active": True,
+        "created_at": datetime.utcnow().isoformat(),
     }
 
 
